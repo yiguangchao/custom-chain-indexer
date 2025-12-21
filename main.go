@@ -48,7 +48,7 @@ func main() {
 	// ---------------------------------------------------------
 	dsn := os.Getenv("DB_DSN")
 	if dsn == "" {
-		dsn = "host=localhost user=postgres password=password dbname=web3_indexer port=5432 sslmode=disable"
+		dsn = "host=localhost user=postgres password=123456 dbname=web3_indexer port=5432 sslmode=disable"
 	}
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
@@ -72,6 +72,11 @@ func main() {
 
 	fmt.Println(">>> The indexer has started successfully and entered daemon mode...")
 
+	// ==========================================
+	// New: Starting API Server
+	// ==========================================
+	go StartServer(db)
+
 	// ---------------------------------------------------------
 	// Enter while (Daemon Loop)
 	// ---------------------------------------------------------
@@ -93,14 +98,14 @@ func main() {
 		// B. Obtain the latest height on the chain (Remote)
 		header, err := client.HeaderByNumber(context.Background(), nil)
 		if err != nil {
-			log.Printf("网络波动: %v", err)
+			log.Printf("network fluctuation: %v", err)
 			continue
 		}
 		chainHead := header.Number.Uint64()
 
 		//C. Determine whether synchronization is necessary
 		if startBlock > chainHead {
-			fmt.Printf("\r>>> 已追平最新块 [%d]... 等待新块...", chainHead)
+			fmt.Printf("\r>>> Matched with the latest block [%d]... Waiting for a new block...", chainHead)
 			continue
 		}
 
