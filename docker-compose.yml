@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: web3-indexer
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      # The host here must be filled with 'db' (service name in Docker network), not localhost
+      - DB_DSN=host=db user=postgres password=mysecretpassword dbname=web3_indexer port=5432 sslmode=disable
+      # Replace here with your Infura/Achemy Key
+      - RPC_URL=https://mainnet.infura.io/v3/YOUR_ACTUAL_API_KEY_HERE
+    depends_on:
+      - db # Wait for the database to start before launching the app
+
+  # 2. database service
+  db:
+    image: postgres:15-alpine
+    container_name: indexer-postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_DB=web3_indexer
+    ports:
+      - "5432:5432"
+    # Persistent data mounting (to prevent data loss during Docker restart)
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+# Define data volume
+volumes:
+  pg_data:
