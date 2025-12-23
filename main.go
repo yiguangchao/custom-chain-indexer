@@ -60,11 +60,12 @@ func main() {
 	// ---------------------------------------------------------
 	// B. Connect blockchain nodes
 	// ---------------------------------------------------------
-	rpcUrl := "https://mainnet.infura.io/v3/96ca8d4da9ef40c29975cad96332357b"
-	client, err := ethclient.Dial(rpcUrl)
-	if err != nil {
-		log.Fatal(err)
+	rpcUrl := os.Getenv("RPC_URL")
+	if rpcUrl == "" {
+		rpcUrl = "https://mainnet.infura.io/v3/YOUR_LOCAL_TEST_KEY"
 	}
+
+	client, err := ethclient.Dial(rpcUrl)
 
 	// 3. Prepare ABI
 	contractAbi, _ := abi.JSON(strings.NewReader(token.Erc20ABI))
