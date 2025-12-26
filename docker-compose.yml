@@ -30,6 +30,28 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
 
+  # 1. Prometheus service
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: indexer-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+
+  # 2. Grafana service
+  grafana:
+    image: grafana/grafana:latest
+    container_name: indexer-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+
 # Define data volume
 volumes:
   pg_data:
