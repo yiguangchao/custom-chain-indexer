@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gorm.io/gorm"
 )
 
@@ -13,6 +14,12 @@ import (
 func StartServer(db *gorm.DB) {
 	// 1. Initialize Gin engine
 	r := gin.Default()
+
+	// ==========================================
+	// Prometheus monitoring interface
+	// ==========================================
+	// Prometheus will access this interface every few seconds and take away the data
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// 2. Define routing
 	// GET /api/v1/transfers?address=0x123...&limit=10

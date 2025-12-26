@@ -58,6 +58,8 @@ func main() {
 	// Auto Migration, similar to Hibernate's ddl auto
 	db.AutoMigrate(&TransferLog{}, &SyncState{})
 
+	InitMetrics()
+
 	// ---------------------------------------------------------
 	// B. Connect blockchain nodes
 	// ---------------------------------------------------------
@@ -99,8 +101,8 @@ func main() {
 		// B. Get the latest height on the chain (used to determine if it is tied)
 		header, err := client.HeaderByNumber(context.Background(), nil)
 		if err != nil {
-			log.Printf("Network error: %v", err)
-			continue
+			chainHead := header.Number.Uint64()
+			MetricChainHead.Set(float64(chainHead))
 		}
 		chainHead := header.Number.Uint64()
 
@@ -153,6 +155,9 @@ func main() {
 		state.LastBlockHash = lastBlockHash
 		db.Save(&state)
 
+		MetricLastBlock.Set(float64(endBlock))
+
+		// G. [Monitoring] Update local altitude indicators
 		fmt.Printf(" -> synchronously complete: %d (Hash: %s...)\n", endBlock, lastBlockHash[:10])
 	}
 }
@@ -220,6 +225,9 @@ func processBatch(client *ethclient.Client, db *gorm.DB, address common.Address,
 				return "", err
 			}
 			fmt.Printf("   -> Successfully stored %d transaction records\n", len(dataList))
+
+			// [Monitoring] Counter+N
+			MetricIndexedTxTotal.Add(float64(len(dataList)))
 		}
 	}
 
