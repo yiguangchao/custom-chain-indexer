@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"math/big"
@@ -20,6 +21,8 @@ import (
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+
+	"sync"
 )
 
 // 1. Define database model (Entity)
@@ -44,6 +47,16 @@ type SyncState struct {
 const WorkerID = "usdt_worker"
 
 func main() {
+
+	// ==========================================
+	// 1. Define command-line parameters
+	// ==========================================
+	backfillMode := flag.Bool("backfill", false, "Enable historical data backfilling mode")
+	startBlock := flag.Int64("start", 17000000, "Backfilling starting block")
+	endBlock := flag.Int64("end", 18000000, "Backfilling completed block")
+	workers := flag.Int("workers", 5, "Concurrent coroutine count (recommendation 3-10)")
+	flag.Parse()
+
 	// ---------------------------------------------------------
 	// 1. Connect nodes (Connections)
 	// ---------------------------------------------------------
@@ -75,6 +88,15 @@ func main() {
 	contractAddress := common.HexToAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7")
 
 	fmt.Println(">>> The indexer has started successfully and entered daemon mode...")
+
+	// ==========================================
+	// 4. Mode diversion
+	// ==========================================
+	if *backfillMode {
+		fmt.Printf("🚀 Activate backfill mode: Block %d -> %d | Workers: %d\n", *startBlock, *endBlock, *workers)
+		startBackfill(client, db, contractAddress, contractAbi, *startBlock, *endBlock, *workers)
+		return
+	}
 
 	// ==========================================
 	// New: Starting API Server
@@ -263,4 +285,68 @@ func rollback(db *gorm.DB, state *SyncState) error {
 
 		return nil
 	})
+}
+
+// Job Define a job task: processing blocks from Start to End
+type Job struct {
+	From int64
+	To   int64
+}
+
+func startBackfill(client *ethclient.Client, db *gorm.DB, address common.Address, abi abi.ABI, start int64, end int64, workerCount int) {
+	// 1. Create task channel (with buffering to prevent blocking)
+	jobs := make(chan Job, workerCount*2)
+
+	// 2. Create a WaitGroup to ensure that all workers have completed their tasks before exiting
+	var wg sync.WaitGroup
+
+	// 3. Activate Workers
+	for w := 1; w <= workerCount; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			workerLogic(id, client, db, address, abi, jobs)
+		}(w)
+	}
+
+	// 4. Producer: responsible for distributing tasks
+	// Allocate 100 blocks per time (Batch Size), which can be slightly larger for historical
+	// backfilling compared to real-time 10 blocks
+	batchSize := int64(100)
+	for i := start; i < end; i += batchSize {
+		currentEnd := i + batchSize - 1
+		if currentEnd > end {
+			currentEnd = end
+		}
+
+		// Throw the task into the channel
+		jobs <- Job{From: i, To: currentEnd}
+	}
+
+	// 5. Task completed, close channel
+	close(jobs)
+
+	// 6. Waiting for all workers to finish work
+	wg.Wait()
+	fmt.Println("All historical data backfilling has been completed!")
+}
+
+// Specific work logic of workers
+func workerLogic(id int, client *ethclient.Client, db *gorm.DB, address common.Address, abi abi.ABI, jobs <-chan Job) {
+	for job := range jobs {
+		fmt.Printf("[Worker %d] Processing: %d - %d\n", id, job.From, job.To)
+
+		// Reuse the processBatch function!
+		// Note: Backfilling does not require concern for Reorg (historical data is usually finalized),
+		// nor does it require a return value Hash
+		// So we need to add a simple retry mechanism to prevent network jitter from causing data loss in this area
+		for retry := 0; retry < 3; retry++ {
+			_, err := processBatch(client, db, address, abi, job.From, job.To)
+			if err == nil {
+				break
+			}
+			fmt.Printf("[Worker %d] Retry on failure (%d/3): %v\n", id, retry+1, err)
+			time.Sleep(time.Second * 1)
+		}
+	}
 }
