@@ -86,7 +86,7 @@ func StartServer(db *gorm.DB, port string) {
 		})
 	})
 
-	log.Println(">>> The API server starts on port %s...", port)
+	log.Printf(">>> The API server starts on port %s...", port)
 	if err := r.Run(":" + port); err != nil {
 		log.Fatal("Server startup failed:", err)
 	}
