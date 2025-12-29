@@ -8,10 +8,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # The host here must be filled with 'db' (service name in Docker network), not localhost
-      - DB_DSN=host=db user=postgres password=mysecretpassword dbname=web3_indexer port=5432 sslmode=disable
-      # Replace here with your Infura/Achemy Key
-      - RPC_URL=https://mainnet.infura.io/v3/YOUR_ACTUAL_API_KEY_HERE
+      - APP_DATABASE_DSN=host=db user=postgres password=mysecretpassword dbname=web3_indexer port=5432 sslmode=disable
+      - APP_CHAIN_RPC_URL=${RPC_URL}
+      - APP_SERVER_PORT=8080
     depends_on:
       - db # Wait for the database to start before launching the app
 
