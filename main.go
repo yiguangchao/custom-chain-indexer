@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"custom-chiain-indexer/token"
 	"flag"
 	"fmt"
 	"log"
@@ -9,9 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"os"
-
-	"custom-chiain-indexer/token"
+	"custom-chiain-indexer/config"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -48,27 +47,24 @@ const WorkerID = "usdt_worker"
 
 func main() {
 
+	cfg := config.LoadConfig()
+
 	// ==========================================
 	// 1. Define command-line parameters
 	// ==========================================
 	backfillMode := flag.Bool("backfill", false, "Enable historical data backfilling mode")
-	startBlock := flag.Int64("start", 17000000, "Backfilling starting block")
-	endBlock := flag.Int64("end", 18000000, "Backfilling completed block")
+	startBlock := flag.Int64("start", cfg.Chain.StartBlock, "Backfilling starting block")
+	endBlock := flag.Int64("end", cfg.Chain.StartBlock+1000, "Backfilling completed block")
 	workers := flag.Int("workers", 5, "Concurrent coroutine count (recommendation 3-10)")
 	flag.Parse()
 
 	// ---------------------------------------------------------
 	// 1. Connect nodes (Connections)
 	// ---------------------------------------------------------
-	dsn := os.Getenv("DB_DSN")
-	if dsn == "" {
-		dsn = "host=localhost user=postgres password=123456 dbname=web3_indexer port=5432 sslmode=disable"
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(postgres.Open(cfg.Database.Dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Database connection failed:", err)
 	}
-	// Auto Migration, similar to Hibernate's ddl auto
 	db.AutoMigrate(&TransferLog{}, &SyncState{})
 
 	InitMetrics()
@@ -76,16 +72,14 @@ func main() {
 	// ---------------------------------------------------------
 	// B. Connect blockchain nodes
 	// ---------------------------------------------------------
-	rpcUrl := os.Getenv("RPC_URL")
-	if rpcUrl == "" {
-		rpcUrl = "https://mainnet.infura.io/v3/YOUR_LOCAL_TEST_KEY"
+	client, err := ethclient.Dial(cfg.Chain.RpcUrl)
+	if err != nil {
+		log.Fatal("RPC connection failed:", err)
 	}
-
-	client, err := ethclient.Dial(rpcUrl)
 
 	// 3. Prepare ABI
 	contractAbi, _ := abi.JSON(strings.NewReader(token.Erc20ABI))
-	contractAddress := common.HexToAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+	contractAddress := common.HexToAddress(cfg.Chain.ContractAddress)
 
 	fmt.Println(">>> The indexer has started successfully and entered daemon mode...")
 
@@ -101,7 +95,7 @@ func main() {
 	// ==========================================
 	// New: Starting API Server
 	// ==========================================
-	go StartServer(db)
+	go StartServer(db, cfg.Server.Port)
 
 	// ---------------------------------------------------------
 	// Enter while (Daemon Loop)

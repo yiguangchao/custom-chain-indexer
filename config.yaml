@@ -1,0 +1,13 @@
+server:
+  port: "8080"
+
+database:
+  # Database connection for local development
+  dsn: "host=localhost user=postgres password=password dbname=web3_indexer port=5432 sslmode=disable"
+
+chain:
+  # Replace with yours Infura/Alchemy Key
+  rpc_url: "https://mainnet.infura.io/v3/YOUR_API_KEY_HERE"
+  # USDT contract address
+  contract_address: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+  start_block: 18000000
