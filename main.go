@@ -2,299 +2,330 @@ package main
 
 import (
 	"context"
-	"custom-chiain-indexer/token"
 	"flag"
 	"fmt"
 	"log"
 	"math/big"
+	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"custom-chiain-indexer/config"
+	"custom-chiain-indexer/token"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"gorm.io/gorm/clause"
-
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-
-	"sync"
+	"gorm.io/gorm/clause"
 )
 
-// 1. Define database model (Entity)
-// Corresponding to the transfer_Logs table in the database
+// ==========================================
+// 1. Database Models
+// ==========================================
+
+// TransferLog represents the ERC20 transfer event stored in DB
 type TransferLog struct {
 	ID          uint   `gorm:"primaryKey"`
-	TxHash      string `gorm:"type:char(66);uniqueIndex:idx_tx_log"`
+	TxHash      string `gorm:"type:char(66);uniqueIndex:idx_tx_log"` // Part of composite unique index
 	BlockNumber uint64
-	LogIndex    uint   `gorm:"uniqueIndex:idx_tx_log"`
+	LogIndex    uint   `gorm:"uniqueIndex:idx_tx_log"` // Part of composite unique index
 	FromAddress string `gorm:"type:char(42);index"`
 	ToAddress   string `gorm:"type:char(42);index"`
-	Amount      string `gorm:"type:varchar(78)"`
+	Amount      string `gorm:"type:varchar(78)"` // Stored as string to prevent precision loss
 }
 
+// SyncState tracks the synchronization progress
 type SyncState struct {
 	ID            string `gorm:"primaryKey"`
 	LastBlockNum  uint64
 	LastBlockHash string `gorm:"type:char(66)"`
 }
 
-// Define a constant ID to mark our process in the database
 const WorkerID = "usdt_worker"
 
-func main() {
+// ==========================================
+// 2. Main Entry Point (The Commander)
+// ==========================================
 
+func main() {
+	// A. Load Configuration
 	cfg := config.LoadConfig()
 
-	// ==========================================
-	// 1. Define command-line parameters
-	// ==========================================
-	backfillMode := flag.Bool("backfill", false, "Enable historical data backfilling mode")
-	startBlock := flag.Int64("start", cfg.Chain.StartBlock, "Backfilling starting block")
-	endBlock := flag.Int64("end", cfg.Chain.StartBlock+1000, "Backfilling completed block")
-	workers := flag.Int("workers", 5, "Concurrent coroutine count (recommendation 3-10)")
+	// B. Parse Command Line Flags
+	// These allow overriding behavior at runtime, e.g., for backfilling data
+	backfillMode := flag.Bool("backfill", false, "Enable historical data backfill mode")
+	startBlock := flag.Int64("start", cfg.Chain.StartBlock, "Backfill start block (defaults to config)")
+	endBlock := flag.Int64("end", cfg.Chain.StartBlock+1000, "Backfill end block")
+	workers := flag.Int("workers", 5, "Number of concurrent workers for backfill")
 	flag.Parse()
 
-	// ---------------------------------------------------------
-	// 1. Connect nodes (Connections)
-	// ---------------------------------------------------------
+	// C. Initialize Database
 	db, err := gorm.Open(postgres.Open(cfg.Database.Dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatal("Database connection failed:", err)
+		log.Fatal("Failed to connect to Database:", err)
 	}
+	// Auto-migrate tables
 	db.AutoMigrate(&TransferLog{}, &SyncState{})
 
-	InitMetrics()
-
-	// ---------------------------------------------------------
-	// B. Connect blockchain nodes
-	// ---------------------------------------------------------
+	// D. Initialize RPC Client
 	client, err := ethclient.Dial(cfg.Chain.RpcUrl)
 	if err != nil {
-		log.Fatal("RPC connection failed:", err)
+		log.Fatal("Failed to connect to RPC:", err)
 	}
 
-	// 3. Prepare ABI
+	// E. Prepare Smart Contract ABI and Address
 	contractAbi, _ := abi.JSON(strings.NewReader(token.Erc20ABI))
 	contractAddress := common.HexToAddress(cfg.Chain.ContractAddress)
 
-	fmt.Println(">>> The indexer has started successfully and entered daemon mode...")
-
-	// ==========================================
-	// 4. Mode diversion
-	// ==========================================
+	// F. Mode Branching: Backfill Mode
+	// If enabled, run the backfill engine and exit immediately after completion
 	if *backfillMode {
-		fmt.Printf("🚀 Activate backfill mode: Block %d -> %d | Workers: %d\n", *startBlock, *endBlock, *workers)
+		fmt.Printf("🚀 Starting Backfill Mode: Block %d -> %d | Workers: %d\n", *startBlock, *endBlock, *workers)
 		startBackfill(client, db, contractAddress, contractAbi, *startBlock, *endBlock, *workers)
 		return
 	}
 
 	// ==========================================
-	// New: Starting API Server
+	// G. Realtime Indexer Mode (Daemon)
 	// ==========================================
-	go StartServer(db, cfg.Server.Port)
 
-	// ---------------------------------------------------------
-	// Enter while (Daemon Loop)
-	// ---------------------------------------------------------
-	ticker := time.NewTicker(3 * time.Second) // Check every 3 seconds
+	// 1. Initialize Prometheus Metrics
+	InitMetrics()
+
+	// 2. Start API Server (in a non-blocking goroutine)
+	srv := StartServer(db, cfg.Server.Port)
+
+	// 3. Setup Graceful Shutdown
+	// Create a channel to listen for OS signals (Ctrl+C, Docker Stop)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// 4. Create a Context for the Indexer
+	// This allows us to signal the worker loop to stop safely
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 5. Start the Indexer Logic in a separate Goroutine
+	go StartIndexer(ctx, client, db, contractAddress, contractAbi)
+
+	// 6. Block Main Thread until a signal is received
+	<-quit
+	log.Println("🛑 Shutdown signal received. Closing application safely...")
+
+	// 7. Signal the Indexer to stop
+	cancel()
+
+	// 8. Shutdown API Server (Wait max 5 seconds for active requests)
+	ctxServer, cancelServer := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelServer()
+
+	if err := srv.Shutdown(ctxServer); err != nil {
+		log.Fatal("API Server forced to shutdown:", err)
+	}
+
+	log.Println("✅ System exited successfully.")
+}
+
+// ==========================================
+// 3. Realtime Indexer Logic
+// ==========================================
+
+// StartIndexer runs the main loop for data synchronization
+func StartIndexer(ctx context.Context, client *ethclient.Client, db *gorm.DB,
+	contractAddress common.Address, contractAbi abi.ABI) {
+	fmt.Println(">>> Indexer started in Daemon Mode...")
+	// Poll every 3 seconds (adjust based on block time)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		// A. Get local status
-		var state SyncState
-		if err := db.FirstOrCreate(&state, SyncState{ID: WorkerID, LastBlockNum: 18000000}).Error; err != nil {
-			log.Printf("Reading status failed: %v", err)
-			continue
+	for {
+		select {
+		case <-ctx.Done():
+			// Stop signal received from main()
+			fmt.Println(">>> Indexer stopping after current batch...")
+			return
+		case <-ticker.C:
+			// Execute business logic
+			runSyncLogic(client, db, contractAddress, contractAbi)
 		}
-
-		// Target Block=Local Latest+1
-		targetBlockNum := state.LastBlockNum + 1
-
-		// B. Get the latest height on the chain (used to determine if it is tied)
-		header, err := client.HeaderByNumber(context.Background(), nil)
-		if err != nil {
-			chainHead := header.Number.Uint64()
-			MetricChainHead.Set(float64(chainHead))
-		}
-		chainHead := header.Number.Uint64()
-
-		if targetBlockNum > chainHead {
-			fmt.Printf("\r>>> Already equalized [%d]... Waiting for a new block...", chainHead)
-			continue
-		}
-
-		// =========================================================
-		// Core addition: Reorg security check
-		// =========================================================
-		if state.LastBlockHash != "" {
-			// 1. Get the header of the new block (targetBlock) to be synchronized
-			targetHeader, err := client.HeaderByNumber(context.Background(), big.NewInt(int64(targetBlockNum)))
-			if err != nil {
-				log.Printf("Failed to retrieve the header of the target block: %v", err)
-				continue
-			}
-
-			// 2. Check whether the ParentHash of the new block is equal to the Hash in the database (LastBlockHash)
-			if targetHeader.ParentHash.Hex() != state.LastBlockHash {
-				// Not matching! The LastBlock in the database is no longer on the main chain
-				log.Printf("Hash mismatch! Local: %s, on chain Parent: %s",
-					state.LastBlockHash, targetHeader.ParentHash.Hex())
-
-				// 3. Perform rollback
-				if err := rollback(db, &state); err != nil {
-					log.Printf("Rollback failed: %v", err)
-				}
-				continue // Skip this loop after rollback and restart
-			}
-		}
-		// =========================================================
-
-		// D. Batch capture range (Batch Size = 10)
-		endBlock := targetBlockNum + 10
-		if endBlock > chainHead {
-			endBlock = chainHead
-		}
-
-		// E. Execute Capture
-		lastBlockHash, err := processBatch(client, db, contractAddress, contractAbi, int64(targetBlockNum), int64(endBlock))
-		if err != nil {
-			log.Println("Processing failed, retry...")
-			continue
-		}
-
-		// F. Update Status (Save Hash)
-		state.LastBlockNum = endBlock
-		state.LastBlockHash = lastBlockHash
-		db.Save(&state)
-
-		MetricLastBlock.Set(float64(endBlock))
-
-		// G. [Monitoring] Update local altitude indicators
-		fmt.Printf(" -> synchronously complete: %d (Hash: %s...)\n", endBlock, lastBlockHash[:10])
 	}
 }
 
-// processBatch Responsible for capturing ->parsing ->storing
+func runSyncLogic(client *ethclient.Client, db *gorm.DB, address common.Address, contractAbi abi.ABI) {
+	// A. Get Local State (Where did stop?)
+	var state SyncState
+	// If no state exists, start from default
+	if err := db.FirstOrCreate(&state, SyncState{ID: WorkerID, LastBlockNum: 18000000}).Error; err != nil {
+		log.Printf("Failed to read sync state: %v", err)
+		return
+	}
+
+	targetBlockNum := state.LastBlockNum + 1
+
+	// B. Get Remote Chain Head
+	header, err := client.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		log.Printf("Network error (RPC): %v", err)
+		return
+	}
+	chainHead := header.Number.Uint64()
+	MetricChainHead.Set(float64(chainHead)) // Update Metric
+
+	// Check if caught up
+	if targetBlockNum > chainHead {
+		fmt.Printf("\r>>> Synced [%d]... Waiting for new blocks...", chainHead)
+		return
+	}
+
+	// C. Reorg Detection (Safety Check)
+	// If the ParentHash of the new block matches the Hash of last synced block.
+	if state.LastBlockHash != "" {
+		targetHeader, err := client.HeaderByNumber(context.Background(), big.NewInt(int64(targetBlockNum)))
+		if err != nil {
+			log.Printf("Failed to fetch target block header: %v", err)
+			return
+		}
+
+		// If ParentHash mismatch -> Chain Reorg detected!
+		if targetHeader.ParentHash.Hex() != state.LastBlockHash {
+			log.Printf("⚠️ Hash Mismatch! Local: %s, Chain Parent: %s",
+				state.LastBlockHash, targetHeader.ParentHash.Hex())
+			if err := rollback(db, &state); err != nil {
+				log.Printf("Rollback failed: %v", err)
+			}
+			return // Skip this cycle and try again after rollback
+		}
+	}
+
+	// D. Determine Batch Size (Max 10 blocks per request)
+	endBlock := targetBlockNum + 10
+	if endBlock > chainHead {
+		endBlock = chainHead
+	}
+
+	fmt.Printf("\n>>> Syncing: %d -> %d (Lag: %d)\n", targetBlockNum, endBlock, chainHead-endBlock)
+
+	// E. Execute Fetch & Store
+	lastBlockHash, err := processBatch(client, db, address, contractAbi, int64(targetBlockNum), int64(endBlock))
+	if err != nil {
+		log.Println("Batch processing failed, retrying...", err)
+		return
+	}
+
+	// F. Update Sync State
+	state.LastBlockNum = endBlock
+	state.LastBlockHash = lastBlockHash
+	db.Save(&state)
+
+	MetricLastBlock.Set(float64(endBlock)) // Update Metric
+}
+
+// rollback handles chain reorgs by deleting the last synced block
+func rollback(db *gorm.DB, state *SyncState) error {
+	blockNumToDelete := state.LastBlockNum
+	log.Printf("🚨 Reorg detected! Rolling back block: %d", blockNumToDelete)
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		// 1. Delete logs for the invalid block
+		if err := tx.Where("block_number = ?", blockNumToDelete).Delete(&TransferLog{}).Error; err != nil {
+			return err
+		}
+		// 2. Revert state to previous block
+		state.LastBlockNum -= 1
+		state.LastBlockHash = "" // Clear hash to force a re-check next cycle
+		return tx.Save(state).Error
+	})
+}
+
+// processBatch fetches logs, parses them, and stores them in DB.
+// Returns the Hash of the last processed block for state tracking.
 func processBatch(client *ethclient.Client, db *gorm.DB, address common.Address, contractAbi abi.ABI,
 	from int64, to int64) (string, error) {
-	// 1. Construct query conditions
+	// 1. Construct Filter Query
 	query := ethereum.FilterQuery{
 		FromBlock: big.NewInt(from),
 		ToBlock:   big.NewInt(to),
 		Addresses: []common.Address{address},
 	}
 
-	// 2. Initiate RPC request
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// 2. Call RPC
 	logs, err := client.FilterLogs(ctx, query)
 	if err != nil {
-		log.Printf("RPC Failed to retrieve logs [Block %d-%d]: %v", from, to, err)
 		return "", err
 	}
 
-	// 3. Even if the logs are empty, it must still go down because the
-	// function needs to obtain the hash of endBlock at the end
+	// 3. Parse Logs
 	if len(logs) > 0 {
-		// --- Start parsing logic ---
-		type TransferEventData struct {
-			Value *big.Int
-		}
+		type TransferEventData struct{ Value *big.Int }
 		var dataList []TransferLog
 
 		for _, vLog := range logs {
+			// Verify Event Signature (Topic[0])
 			if len(vLog.Topics) < 3 || vLog.Topics[0].Hex() != contractAbi.Events["Transfer"].ID.Hex() {
 				continue
 			}
-
 			var eventData TransferEventData
-			err := contractAbi.UnpackIntoInterface(&eventData, "Transfer", vLog.Data)
-			if err != nil {
+			if err := contractAbi.UnpackIntoInterface(&eventData, "Transfer", vLog.Data); err != nil {
 				continue
 			}
 
-			fromAddr := common.HexToAddress(vLog.Topics[1].Hex()).Hex()
-			toAddr := common.HexToAddress(vLog.Topics[2].Hex()).Hex()
-
+			// Map to Model
 			logModel := TransferLog{
 				TxHash:      vLog.TxHash.Hex(),
 				BlockNumber: vLog.BlockNumber,
 				LogIndex:    vLog.Index,
-				FromAddress: fromAddr,
-				ToAddress:   toAddr,
+				FromAddress: common.HexToAddress(vLog.Topics[1].Hex()).Hex(),
+				ToAddress:   common.HexToAddress(vLog.Topics[2].Hex()).Hex(),
 				Amount:      eventData.Value.String(),
 			}
-
 			dataList = append(dataList, logModel)
 		}
 
-		// Batch warehousing
+		// 4. Batch Insert (Idempotent)
 		if len(dataList) > 0 {
+			// DoNothing on conflict ensures can re-run blocks safely
 			err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&dataList).Error
 			if err != nil {
-				log.Printf("Database write failed: %v", err)
 				return "", err
 			}
-			fmt.Printf("   -> Successfully stored %d transaction records\n", len(dataList))
-
-			// [Monitoring] Counter+N
-			MetricIndexedTxTotal.Add(float64(len(dataList)))
+			fmt.Printf("   -> Successfully indexed %d records\n", len(dataList))
+			MetricIndexedTxTotal.Add(float64(len(dataList))) // Update Metric
 		}
 	}
 
-	// 4. Obtain the hash of the last block in this batch
+	// 5. Fetch EndBlock Header to get its Hash
+	// This is required even if there were no logs in the batch
 	header, err := client.HeaderByNumber(context.Background(), big.NewInt(to))
 	if err != nil {
-		log.Printf("Failed to obtain EndBlock Hash: %v", err)
 		return "", err
 	}
-
 	return header.Hash().Hex(), nil
 }
 
-// Rollback a block: delete all logs at that height and roll back the state by 1
-func rollback(db *gorm.DB, state *SyncState) error {
-	blockNumToDelete := state.LastBlockNum
-	log.Printf("Chain fork detected (Reorg)! Rolling back the block: %d", blockNumToDelete)
+// ==========================================
+// 4. Backfill Engine (Producer-Consumer)
+// ==========================================
 
-	return db.Transaction(func(tx *gorm.DB) error {
-		// 1. Delete all logs (dirty data) at this height
-		if err := tx.Where("block_number = ?", blockNumToDelete).Delete(&TransferLog{}).Error; err != nil {
-			return err
-		}
-
-		// 2. Return the status to the previous block (Num-1)
-		// Note: Simply leaving Hash empty here will trigger the check again in the next loop,
-		state.LastBlockNum -= 1
-		state.LastBlockHash = "" // Empty, force the next round to check the Parent on the chain again
-
-		if err := tx.Save(state).Error; err != nil {
-			return err
-		}
-
-		return nil
-	})
-}
-
-// Job Define a job task: processing blocks from Start to End
 type Job struct {
 	From int64
 	To   int64
 }
 
-func startBackfill(client *ethclient.Client, db *gorm.DB, address common.Address, abi abi.ABI, start int64, end int64, workerCount int) {
-	// 1. Create task channel (with buffering to prevent blocking)
+func startBackfill(client *ethclient.Client, db *gorm.DB, address common.Address, abi abi.ABI, start int64,
+	end int64, workerCount int) {
 	jobs := make(chan Job, workerCount*2)
-
-	// 2. Create a WaitGroup to ensure that all workers have completed their tasks before exiting
 	var wg sync.WaitGroup
 
-	// 3. Activate Workers
+	// Start Consumers (Workers)
 	for w := 1; w <= workerCount; w++ {
 		wg.Add(1)
 		go func(id int) {
@@ -303,43 +334,33 @@ func startBackfill(client *ethclient.Client, db *gorm.DB, address common.Address
 		}(w)
 	}
 
-	// 4. Producer: responsible for distributing tasks
-	// Allocate 100 blocks per time (Batch Size), which can be slightly larger for historical
-	// backfilling compared to real-time 10 blocks
+	// Producer: Generate Jobs
 	batchSize := int64(100)
 	for i := start; i < end; i += batchSize {
 		currentEnd := i + batchSize - 1
 		if currentEnd > end {
 			currentEnd = end
 		}
-
-		// Throw the task into the channel
 		jobs <- Job{From: i, To: currentEnd}
 	}
 
-	// 5. Task completed, close channel
-	close(jobs)
-
-	// 6. Waiting for all workers to finish work
-	wg.Wait()
-	fmt.Println("All historical data backfilling has been completed!")
+	close(jobs) // Signal that no more jobs are coming
+	wg.Wait()   // Wait for all workers to finish
+	fmt.Println("✅ Historical backfill completed successfully!")
 }
 
-// Specific work logic of workers
 func workerLogic(id int, client *ethclient.Client, db *gorm.DB, address common.Address, abi abi.ABI, jobs <-chan Job) {
 	for job := range jobs {
 		fmt.Printf("[Worker %d] Processing: %d - %d\n", id, job.From, job.To)
 
-		// Reuse the processBatch function!
-		// Note: Backfilling does not require concern for Reorg (historical data is usually finalized),
-		// nor does it require a return value Hash
-		// So we need to add a simple retry mechanism to prevent network jitter from causing data loss in this area
+		// Simple retry mechanism for network stability
 		for retry := 0; retry < 3; retry++ {
+			// Ignore the returned hash in backfill mode
 			_, err := processBatch(client, db, address, abi, job.From, job.To)
 			if err == nil {
 				break
 			}
-			fmt.Printf("[Worker %d] Retry on failure (%d/3): %v\n", id, retry+1, err)
+			fmt.Printf("[Worker %d] Retry (%d/3): %v\n", id, retry+1, err)
 			time.Sleep(time.Second * 1)
 		}
 	}

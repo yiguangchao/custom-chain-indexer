@@ -28,7 +28,7 @@ type PaginatedResponse struct {
 	TotalPages int         `json:"total_pages"`
 }
 
-func StartServer(db *gorm.DB, port string) {
+func StartServer(db *gorm.DB, port string) *http.Server {
 	r := gin.Default()
 
 	// monitoring interface
@@ -86,8 +86,18 @@ func StartServer(db *gorm.DB, port string) {
 		})
 	})
 
-	log.Printf(">>> The API server starts on port %s...", port)
-	if err := r.Run(":" + port); err != nil {
-		log.Fatal("Server startup failed:", err)
+	// Define http.Server
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
 	}
+
+	go func() {
+		log.Printf(">>> The API server starts on port %s...", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server startup failed: %v", err)
+		}
+	}()
+
+	return srv
 }
